@@ -1,0 +1,30 @@
+# Ansible
+*.retry
+.ansible/
+roles/*/.galaxy_install_info
+*.pyc
+__pycache__/
+
+# Секреты — НИКОГДА не коммитить
+vault_pass
+.vault_pass
+vault_password_file
+*.pem
+*.key
+
+# SSH-ключи (приватные), если вдруг окажутся внутри проекта
+id_rsa
+id_ed25519
+id_deploy_app
+
+# Резервные копии конфигов, которые делает роль firewall
+*.bak.*
+*.bak
+
+# ОС и редакторы
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/

@@ -1,0 +1,4 @@
+---
+netplan_file: /etc/netplan/99-netcfg.yaml
+
+

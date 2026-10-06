@@ -1,0 +1,15 @@
+---
+- name: Создать пользователя devops
+  ansible.builtin.user:
+    name: "{{ users_devops_name }}"
+    groups: "{{ users_devops_groups }}"
+    append: true
+    shell: "{{ users_devops_shell }}"
+    create_home: true
+    state: present
+
+- name: Добавить публичный SSH-ключ devops
+  ansible.posix.authorized_key:
+    user: "{{ users_devops_name }}"
+    state: present
+    key: "{{ lookup('file', users_devops_ssh_key_file) }}"

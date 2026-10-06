@@ -1,0 +1,41 @@
+---
+- name: Убедиться, что netplan установлен
+  ansible.builtin.apt:
+    name: netplan.io
+    state: present
+
+- name: Проверить структуру netplan_config
+  ansible.builtin.assert:
+    that:
+      - netplan_config is defined
+      - netplan_config.network is defined
+      - netplan_config.network.ethernets is defined
+      - netplan_config.network.ethernets | length > 0
+      - netplan_config.network.ethernets | dict2items | selectattr('value.addresses', 'defined') | list | length == netplan_config.network.ethernets | length
+      - netplan_config.network.ethernets | dict2items | map(attribute='value.addresses') | flatten | select('match', '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$') | list | length == netplan_config.network.ethernets | dict2items | map(attribute='value.addresses') | flatten | length
+    fail_msg: "netplan_config некорректен для {{ inventory_hostname }}: проверьте host_vars"
+    quiet: true
+
+- name: Настроить hostname
+  ansible.builtin.hostname:
+    name: "{{ inventory_hostname }}"
+    use: systemd
+
+- name: Отрендерить конфиг netplan
+  ansible.builtin.template:
+    src: netplan.j2
+    dest: "{{ netplan_file }}"
+    owner: root
+    group: root
+    mode: "0600"
+    backup: true
+    validate: >-
+      bash -c '
+      set -e;
+      d=$(mktemp -d);
+      trap "rm -rf $d" EXIT;
+      mkdir -p "$d/etc/netplan";
+      cp %s "$d/etc/netplan/99-test.yaml";
+      netplan generate --root-dir "$d"
+      '
+  notify: netplan apply

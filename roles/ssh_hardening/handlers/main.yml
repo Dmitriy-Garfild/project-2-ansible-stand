@@ -1,0 +1,12 @@
+- name: Validate effective sshd config
+  ansible.builtin.command:
+    cmd: sshd -t
+  changed_when: false
+  check_mode: false
+  listen: restart ssh
+
+- name: Restart ssh
+  ansible.builtin.service:
+    name: "{{ ssh_hardening_service }}"
+    state: restarted
+  listen: restart ssh

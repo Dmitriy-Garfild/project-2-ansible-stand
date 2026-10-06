@@ -1,0 +1,5 @@
+---
+users_devops_name: devops1
+users_devops_groups: sudo
+users_devops_shell: /bin/bash
+users_devops_ssh_key_file: keys/devops_ed25519.pub

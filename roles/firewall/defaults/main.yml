@@ -1,0 +1,44 @@
+---
+# --- Общее ---
+firewall_enabled: true
+
+# --- Интерфейсы ---
+firewall_internal_iface: enp0s8      # 192.168.1.x — доверенный
+firewall_external_iface: enp0s3      # 10.10.10.x — закрытый
+
+# --- Подсети ---
+firewall_internal_cidr: "192.168.1.0/24"
+firewall_external_cidr: "10.10.10.0/24"
+
+# --- SSH: единственный входящий доступ снаружи ---
+firewall_ssh_port: 22
+firewall_ssh_proto: tcp
+firewall_ssh_sources:
+  - "10.10.10.2/32"   # хостовая машина
+  - "10.10.10.1/32"   # VirtualBox NAT (страховка под проброс)
+
+# --- Обмен между VM по внешней сети ---
+firewall_allow_vm_mesh: true
+firewall_vm_mesh_sources:
+  - "10.10.10.11/32"  # vm-deploy      (Ansible-путь по внешней сети)
+  - "10.10.10.12/32"  # vm-app
+  - "10.10.10.13/32"  # vm-app-2
+firewall_vm_mesh_ports:
+  - "22"
+
+# --- Доп. порты снаружи (по умолчанию пусто) ---
+firewall_external_tcp_ports: []
+firewall_external_udp_ports: []
+
+# --- Исходящие разрешены ---
+firewall_allow_outgoing: true
+
+# --- Управление ---
+firewall_manage_service: true
+firewall_config_path: /etc/nftables.conf
+firewall_backup: true
+
+# --- Самопроверка / отладка ---
+firewall_safety_validate: true
+firewall_allowed_group: app
+firewall_debug_diff: false

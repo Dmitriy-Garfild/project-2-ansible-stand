@@ -1,0 +1,14 @@
+---
+common_packages:
+  - vim
+  - curl
+  - htop
+  - git
+  - net-tools
+  - nano
+  - mc
+
+common_timezone: "Europe/Moscow"
+
+common_hosts_entries: []
+

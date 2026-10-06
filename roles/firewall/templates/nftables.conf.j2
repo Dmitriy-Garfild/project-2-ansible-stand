@@ -1,0 +1,115 @@
+#!/usr/sbin/nft -f
+# =====================================================================
+# nftables — {{ inventory_hostname }}
+# Роль firewall.
+#
+# Внутренний: {{ firewall_internal_iface }} ({{ firewall_internal_cidr }}) — доверенный
+# Внешний:    {{ firewall_external_iface }} ({{ firewall_external_cidr }}) — закрытый
+#
+# ВАЖНО про идемпотентность:
+# nft -f НЕ «замещает» отдельные правила в существующей цепочке — он их
+# ДОПИСЫВАЕТ. Поэтому таблица пересоздаётся целиком в одной транзакции:
+#   1) пустое 'table inet filter {}' — создаёт таблицу, если её нет
+#      (идемпотентно, ошибки «не существует» не будет);
+#   2) 'delete table inet filter' — удаляет её гарантированно;
+#   3) финальное объявление — создаёт заново уже актуальным.
+# Транзакция атомарна: окна «без фильтра» нет, накопления правил нет.
+# =====================================================================
+
+table inet filter {
+}
+
+delete table inet filter
+
+table inet filter {
+
+    # -----------------------------------------------------------------
+    # Наборы (sets)
+    # -----------------------------------------------------------------
+    set ssh_sources {
+        type ipv4_addr
+        flags interval
+        elements = { {{ firewall_ssh_sources | join(', ') }} }
+    }
+
+{% if firewall_allow_vm_mesh | bool %}
+    set vm_mesh_sources {
+        type ipv4_addr
+        flags interval
+        elements = { {{ firewall_vm_mesh_sources | join(', ') }} }
+    }
+{% endif %}
+
+    # -----------------------------------------------------------------
+    # Входной трафик
+    # -----------------------------------------------------------------
+    chain input {
+        type filter hook input priority filter; policy drop;
+
+        # Уже установленные соединения
+        ct state established,related accept
+
+        # loopback
+        iif "lo" accept
+
+        # ВНУТРЕННИЙ интерфейс — доверенный, весь трафик по нему разрешён
+        iifname "{{ firewall_internal_iface }}" accept
+
+        # Заведомо невалидные пакеты
+        ct state invalid drop
+
+        # ВНЕШНИЙ интерфейс: SSH только с доверенных источников
+        iifname "{{ firewall_external_iface }}" ip saddr @ssh_sources {{ firewall_ssh_proto }} dport {{ firewall_ssh_port }} ct state new accept
+
+{% if firewall_allow_vm_mesh | bool %}
+        # Обмен между VM по внешней сети
+        iifname "{{ firewall_external_iface }}" ip saddr @vm_mesh_sources tcp dport { {{ firewall_vm_mesh_ports | join(', ') }} } ct state new accept
+{% endif %}
+
+{% if firewall_external_tcp_ports | length > 0 %}
+        # Дополнительные TCP-порты снаружи
+        iifname "{{ firewall_external_iface }}" tcp dport { {{ firewall_external_tcp_ports | join(', ') }} } ct state new accept
+{% endif %}
+
+{% if firewall_external_udp_ports | length > 0 %}
+        # Дополнительные UDP-порты снаружи
+        iifname "{{ firewall_external_iface }}" udp dport { {{ firewall_external_udp_ports | join(', ') }} } ct state new accept
+{% endif %}
+
+        # ICMP / ICMPv6 снаружи — для диагностики
+        iifname "{{ firewall_external_iface }}" icmp type { echo-request, destination-unreachable, time-exceeded } accept
+        iifname "{{ firewall_external_iface }}" icmpv6 type { echo-request, destination-unreachable, packet-too-big, time-exceeded, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert } accept
+
+        # Логирование и тихий drop всего остального
+        log prefix "nft-drop: " level info limit rate 10/minute
+        drop
+    }
+
+{% if firewall_allow_outgoing | bool %}
+    # -----------------------------------------------------------------
+    # Транзитный трафик — хост не роутер
+    # -----------------------------------------------------------------
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+        ct state invalid drop
+        drop
+    }
+
+    # -----------------------------------------------------------------
+    # Исходящий трафик
+    # -----------------------------------------------------------------
+    chain output {
+        type filter hook output priority filter; policy accept;
+    }
+{% else %}
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+        ct state invalid drop
+        drop
+    }
+
+    chain output {
+        type filter hook output priority filter; policy drop;
+    }
+{% endif %}
+}

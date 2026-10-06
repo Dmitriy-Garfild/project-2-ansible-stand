@@ -1,0 +1,527 @@
+=====================================================================
+project-2-ansible-stand
+=====================================================================
+
+Ansible-стенд для базовой настройки серверов приложений:
+подготовка узлов, пользователи и SSH-ключи, hardening SSH,
+сеть (netplan) и межсетевой экран (nftables).
+
+
+---------------------------------------------------------------------
+1. СТЕНД
+---------------------------------------------------------------------
+
+Стенд собран на VirtualBox: эталонная VM vm-app склонирована
+в vm-app-2. После клонирования заданы hostname и сетевые параметры,
+обе машины прописаны в /etc/hosts на управляющем узле vm-deploy.
+
+  Узел        Внутренняя сеть      NAT-сеть           Шлюз         Роль
+  ----------  -------------------  -----------------  -----------  ----------------
+  vm-deploy   192.168.1.11         10.10.10.11        10.10.10.1   управляющий узел
+  vm-app      192.168.1.12         10.10.10.12        10.10.10.1   целевой сервер
+  vm-app-2    192.168.1.13         10.10.10.13        10.10.10.1   целевой сервер
+
+Управляющий узел ходит к целевым по внутренней сети, целевые
+между собой — по внешней (mesh).
+
+
+---------------------------------------------------------------------
+2. СТРУКТУРА ПРОЕКТА
+---------------------------------------------------------------------
+
+project-2-ansible-stand/
+|
++-- ansible.cfg
++-- site.yml
++-- inventories/
+|   +-- production/
+|       +-- hosts                      # inventory (INI)
+|       +-- group_vars/
+|       |   +-- all/
+|       |   |   +-- main.yml           # общие переменные (таймзона,
+|       |   |   |                      # /etc/hosts, become_pass)
+|       |   |   +-- vault.yml          # ЗАШИФРОВАН: пароль sudo
+|       |   +-- all.yml
+|       |   +-- app.yml
+|       +-- host_vars/
+|           +-- vm-app.yml             # netplan_config для vm-app
+|           +-- vm-app-2.yml           # netplan_config для vm-app-2
++-- roles/
+    +-- common/
+    +-- users/
+    +-- ssh_hardening/
+    +-- network/
+    +-- firewall/
+
+
+---------------------------------------------------------------------
+3. ansible.cfg
+---------------------------------------------------------------------
+
+[defaults]
+inventory            = ./inventories/production
+remote_user          = dim
+private_key_file     = ~/.ssh/id_deploy_app
+host_key_checking    = False
+vault_password_file  = ~/.ansible/vault_pass
+editor               = nano
+
+[privilege_escalation]
+become               = True
+become_method        = sudo
+become_user          = root
+become_ask_pass      = False
+
+Ключевые моменты:
+
+- inventory — каталог ./inventories/production;
+- приватный ключ для подключения к целевым узлам — ~/.ssh/id_deploy_app;
+- host_key_checking = False — чтобы клоны VM не спотыкались
+  о смену host key;
+- vault_password_file — файл с паролем Vault, чтобы не вводить
+  его вручную;
+- editor = nano — Ansible зовёт редактор для ansible-vault edit;
+- привилегии повышаются через sudo до root без интерактивного ввода
+  пароля (become_ask_pass = False, пароль берётся из Vault);
+- пароль sudo передаётся через переменную ansible_become_pass
+  (см. group_vars/all/main.yml), а сам пароль лежит в зашифрованном
+  vault.yml.
+
+
+---------------------------------------------------------------------
+4. INVENTORY
+---------------------------------------------------------------------
+
+Файл inventories/production/hosts (без расширения — Ansible парсит
+каталог без проблем):
+
+[all:vars]
+ansible_user=dim
+ansible_python_interpreter=/usr/bin/python3
+
+[app]
+vm-app      ansible_host=192.168.1.12
+vm-app-2    ansible_host=192.168.1.13
+
+[deploy]
+vm-deploy   ansible_host=192.168.1.11 ansible_connection=local
+
+[linux:children]
+app
+deploy
+
+Особенности:
+
+- vm-deploy подключается локально (ansible_connection=local) —
+  управляющий узел не ходит к себе по SSH;
+- группа app — целевые серверы, к которым применяются роли;
+- группа linux объединяет целевые узлы и управляющий узел;
+- роль firewall применяется только к группе app
+  (ограничение через firewall_allowed_group).
+
+
+---------------------------------------------------------------------
+5. site.yml
+---------------------------------------------------------------------
+
+---
+- name: Базовая настройка серверов приложений
+  hosts: app
+  become: true
+  roles:
+    - common
+    - users
+    - ssh_hardening
+    - network
+    - firewall
+
+Порядок ролей важен: firewall идёт последней, чтобы блокирующие
+правила навешивались на уже настроенную сеть и проверенный SSH.
+
+
+---------------------------------------------------------------------
+6. РОЛИ
+---------------------------------------------------------------------
+
+---------------------------------------------------------------------
+6.1 common — базовая подготовка узла
+---------------------------------------------------------------------
+
+  Файл                        Назначение
+  --------------------------  ------------------------------------------
+  defaults/main.yml           common_packages, common_timezone,
+                              common_hosts_entries
+  tasks/main.yml              кэш apt -> базовые пакеты -> таймзона
+                              -> /etc/hosts
+  templates/hosts.j2          рендер /etc/hosts из common_hosts_entries
+
+Состав:
+
+- пакеты: vim, curl, htop, git, net-tools, nano, mc;
+- таймзона: Europe/Moscow;
+- /etc/hosts по шаблону с записями для vm-deploy и vm-app.
+
+Список пакетов и данные для /etc/hosts вынесены в переменные,
+чтобы роль можно было переиспользовать.
+
+
+---------------------------------------------------------------------
+6.2 users — пользователь devops и SSH-ключи
+---------------------------------------------------------------------
+
+Создаёт пользователя devops с правами sudo и раскладывает его
+публичные SSH-ключи.
+
+roles/users/
++-- defaults/main.yml     # имя пользователя, группа sudo, список ключей
++-- tasks/main.yml        # user -> sudoers -> authorized_key
++-- files/
+    +-- devops_1.pub
+    +-- devops_2.pub
+
+Три задачи:
+
+  Задача             Модуль                       Зачем
+  -----------------  ---------------------------  ---------------------------
+  Создать devops     ansible.builtin.user         пользователь в группе sudo
+                                                  с append: true
+  Sudoers drop-in    ansible.builtin.copy         файл в /etc/sudoers.d/
+                                                  с validate: visudo -cf %s
+  Разложить ключи    ansible.posix.authorized_key ключи из files/ через
+                                                  lookup('file', item) и loop
+
+Механизмы:
+
+- authorized_key кладёт ключ в ~/.ssh/authorized_keys пользователя;
+- lookup('file', ...) читает файл из files/ роли и подставляет
+  содержимое;
+- loop по списку ключей — один ключ на файл;
+- append: true не затирает другие группы пользователя;
+- validate: visudo -cf %s проверяет синтаксис sudoers до применения;
+- ansible.posix — коллекция, в которой живёт authorized_key.
+
+Публичные ключи лежат в репозитории роли — приватные никогда.
+
+
+---------------------------------------------------------------------
+6.3 ssh_hardening — жёсткая настройка SSH
+---------------------------------------------------------------------
+
+Настройка через drop-in, без правки основного конфига.
+
+roles/ssh_hardening/
++-- defaults/main.yml
++-- tasks/main.yml
++-- handlers/main.yml
++-- templates/
+    +-- 00-access.conf.j2
+
+defaults/main.yml — безопасные значения по умолчанию:
+
+  ssh_hardening_config_file: /etc/ssh/sshd_config.d/00-access.conf
+  ssh_hardening_password_auth: false
+  ssh_hardening_permit_root_login: "no"
+  ssh_hardening_pubkey_auth: true
+  ssh_hardening_kbd_interactive_auth: false
+  ssh_hardening_service: ssh
+
+Дефолты жёсткие: даже если переменные не заданы, роль применит
+защищённую конфигурацию, а не слабую.
+
+Задачи (tasks/main.yml):
+
+  Задача                Зачем
+  --------------------  ---------------------------------------
+  apt: openssh-server   страховка, пакет на месте
+  assert                входные данные корректны — падаем
+                        до опасных действий
+  file: sshd_config.d   каталог существует, права 0755
+  template              drop-in 0600, backup, validate,
+                        notify на handler
+
+handlers/main.yml — два слушателя на один listen:
+
+- Validate effective sshd config — sshd -t перед рестартом,
+  check_mode: false;
+- Restart ssh — перезапуск только если валидация прошла.
+
+templates/00-access.conf.j2:
+
+  # {{ ansible_managed }}
+  # Managed by Ansible role ssh_hardening. Do not edit manually.
+
+  PasswordAuthentication {{ ssh_hardening_password_auth | ternary('yes', 'no') }}
+  PermitRootLogin {{ ssh_hardening_permit_root_login }}
+  PubkeyAuthentication {{ ssh_hardening_pubkey_auth | ternary('yes', 'no') }}
+  KbdInteractiveAuthentication {{ ssh_hardening_kbd_interactive_auth | ternary('yes', 'no') }}
+
+Решения:
+
+- Drop-in вместо правки главного конфига — пишем в
+  /etc/ssh/sshd_config.d/00-access.conf. Префикс 00- даёт высший
+  приоритет среди drop-in, основной файл не трогаем.
+- Двойная защита от блокировки — validate: "sshd -t -f %s" в template
+  проверяет кандидата во временном файле до записи, а handler
+  перепроверяет конфиг перед рестартом. Битый конфиг отсекается,
+  sshd остаётся на старой рабочей версии.
+- ternary для булевых -> yes/no — превращает true/false в строки,
+  которые ждёт sshd.
+- assert до записи — ловит отсутствие переменных и недопустимые
+  значения PermitRootLogin.
+- Файл роли — только template: 00-access.conf принадлежит роли
+  целиком и перезаписывается полностью. Ручные правки не сохраняются
+  — по замыслу, чтобы никто в обход роли не вписал
+  PasswordAuthentication yes.
+
+
+---------------------------------------------------------------------
+6.4 network — сеть и hostname через netplan
+---------------------------------------------------------------------
+
+roles/network/
++-- defaults/main.yml
++-- tasks/main.yml
++-- handlers/main.yml
++-- templates/netplan.j2
+
+defaults/main.yml:
+
+  netplan_file: /etc/netplan/99-netcfg.yaml
+
+tasks/main.yml:
+
+  Задача                  Зачем
+  ----------------------  --------------------------------------------
+  apt: netplan.io         пакет netplan на месте
+  assert                  netplan_config задан, network.ethernets
+                          не пуст — защита от подхвата нерабочего
+                          конфига
+  hostname                имя узла = inventory_hostname, use: systemd
+  template                рендер netplan, 0600, backup,
+                          notify: netplan apply
+
+templates/netplan.j2:
+
+  # {{ ansible_managed }}
+  {{ netplan_config | to_nice_yaml(indent=2, sort_keys=false) }}
+
+handlers/main.yml:
+
+  ---
+  - name: netplan apply
+    ansible.builtin.command: netplan apply
+    listen: netplan apply
+
+Сетевые параметры задаются пер-хост в host_vars/vm-app.yml
+и host_vars/vm-app-2.yml:
+
+  ---
+  netplan_config:
+    network:
+      version: 2
+      renderer: networkd
+      ethernets:
+        enp0s3:
+          dhcp4: false
+          addresses:
+            - "10.10.10.12/24"
+          routes:
+            - to: default
+              via: "10.10.10.1"
+          nameservers:
+            addresses:
+              - "10.10.10.1"
+              - "1.1.1.1"
+        enp0s8:
+          dhcp4: false
+          dhcp6: false
+          addresses:
+            - "192.168.1.12/24"
+
+Для vm-app-2 меняются только адреса (10.10.10.13 / 192.168.1.13).
+
+assert здесь ключевой: он не даёт роли применить пустой или неполный
+конфиг, после которого узел потеряет сеть. Рендер идёт в отдельный
+файл 99-netcfg.yaml, применение — через handler только при изменении.
+
+
+---------------------------------------------------------------------
+6.5 firewall — межсетевой экран на nftables
+---------------------------------------------------------------------
+
+Закрытый наружу межсетевой экран на базе nftables. Внутренний
+интерфейс полностью доверенный, наружный закрыт: разрешён только
+SSH с доверенных адресов и обмен между VM.
+
+roles/firewall/
++-- defaults/main.yml
++-- meta/main.yml
++-- tasks/main.yml
++-- templates/
+    +-- nftables.conf.j2
+
+defaults/main.yml (ключевые переменные):
+
+  Переменная                    Значение по умолчанию     Смысл
+  ----------------------------  ------------------------  ---------------------------
+  firewall_internal_iface       enp0s8                    доверенный интерфейс
+                                                          (192.168.1.0/24)
+  firewall_external_iface       enp0s3                    закрытый интерфейс
+                                                          (10.10.10.0/24)
+  firewall_internal_cidr        192.168.1.0/24            внутренняя подсеть
+  firewall_external_cidr        10.10.10.0/24             внешняя подсеть
+  firewall_ssh_port             22                        порт SSH
+  firewall_ssh_proto            tcp                       протокол SSH
+  firewall_ssh_sources          10.10.10.2/32,            адреса, которым разрешён
+                                10.10.10.1/32             SSH снаружи
+  firewall_allow_vm_mesh        true                      обмен между VM по внешней
+                                                          сети
+  firewall_vm_mesh_sources      10.10.10.11-13/32         адреса VM для mesh-обмена
+  firewall_vm_mesh_ports        22                        порты mesh-обмена
+  firewall_external_tcp_ports   []                        доп. TCP-порты снаружи
+  firewall_external_udp_ports   []                        доп. UDP-порты снаружи
+  firewall_allow_outgoing       true                      исходящие разрешены
+  firewall_manage_service       true                      автозагрузка
+                                                          nftables.service
+  firewall_config_path          /etc/nftables.conf        путь к конфигу
+  firewall_backup               true                      бэкап конфига раз в сутки
+  firewall_safety_validate      true                      пост-проверки ruleset
+  firewall_allowed_group        app                       группа, к которой разрешено
+                                                          применять роль
+  firewall_debug_diff           false                     отладочный вывод
+                                                          об изменении ruleset
+
+Логика tasks/main.yml:
+
+1. Проверки — хост входит в группу firewall_allowed_group;
+   параметры корректны; интерфейсы реально существуют
+   в ansible_interfaces.
+2. Пакет — nftables.
+3. Бэкап — текущий конфиг копируется в .bak.<дата> не чаще раза
+   в сутки (force: false).
+4. Рендер — template с validate: "nft -c -f %s", права 0644,
+   идемпотентно.
+5. Применение — nft -f выполняется только при изменении конфига
+   (when: fw_tmpl is changed).
+6. Сервис — nftables.service включён в автозагрузку.
+7. Пост-проверки — в ruleset есть правило dport 22; нет reject
+   (ожидается тихий drop); цепочка input объявлена ровно один раз
+   (защита от накопления правил). Все — под флагом
+   firewall_safety_validate.
+
+Ключевая особенность шаблона — самодостаточность и атомарность.
+nft -f не "замещает" отдельные правила в существующей цепочке,
+а ДОПИСЫВАЕТ их, из-за чего при повторных прогонах ruleset
+накапливает дубликаты. Поэтому таблица пересоздаётся целиком
+в одной транзакции:
+
+  table inet filter {
+  }
+
+  delete table inet filter
+
+  table inet filter {
+      ... актуальные наборы, chains, правила ...
+  }
+
+Пустое объявление создаёт таблицу, если её ещё нет; delete
+гарантированно удаляет её без ошибки "не существует"; финальное
+объявление создаёт заново. Транзакция атомарна — окна
+"без фильтра" нет, накопления правил нет. Так же чисто отрабатывает
+и nftables.service при старте системы.
+
+Что делает ruleset:
+
+- input: политика drop; разрешены established/related, loopback,
+  весь трафик с внутреннего интерфейса; SSH снаружи — только
+  с firewall_ssh_sources; mesh-обмен между VM; ICMP/ICMPv6
+  для диагностики; остальное — логируется (nft-drop:) и тихо
+  дропается;
+- forward: политика drop, хост не роутер;
+- output: политика accept (при firewall_allow_outgoing: true).
+
+meta/main.yml:
+
+  ---
+  galaxy_info:
+    role_name: firewall
+    author: dim
+    description: nftables firewall for app servers
+    license: MIT
+    min_ansible_version: "2.10"
+    platforms:
+      - name: Ubuntu
+        versions:
+          - all
+    galaxy_tags:
+      - networking
+      - security
+      - firewall
+
+  dependencies: []
+
+
+---------------------------------------------------------------------
+7. ОБЩИЕ ПРИНЦИПЫ, ЗАЛОЖЕННЫЕ В ПРОЕКТ
+---------------------------------------------------------------------
+
+- Идемпотентность. Все роли рассчитаны на повторный прогон:
+  первый — что-то меняет, второй — ничего. Проверяется
+  по PLAY RECAP (changed=0).
+- Проверки до опасных действий. В ssh_hardening и network стоят
+  assert перед изменением конфигов — лучше упасть рано с понятным
+  сообщением, чем оставить узел без SSH или без сети.
+- Валидация конфигов. sshd -t и nft -c -f проверяют конфиг
+  до применения; visudo -cf — синтаксис sudoers.
+- Drop-in вместо правки базовых файлов. SSH настраивается через
+  sshd_config.d/00-access.conf, sudo — через /etc/sudoers.d/,
+  сеть — через отдельный 99-netcfg.yaml.
+- Секреты — только в Vault. Пароль sudo лежит зашифрованным
+  в group_vars/all/vault.yml, подставляется через ansible_become_pass.
+- Пути и параметры — в переменных. Роли настраиваются через
+  defaults / group_vars / host_vars, а не захардкоженными значениями.
+- Ограничение области применения. Роль firewall отказывается
+  работать вне группы app.
+
+
+---------------------------------------------------------------------
+8. ПРОБЛЕМЫ И РЕШЕНИЯ
+---------------------------------------------------------------------
+
+  Симптом                        Причина                      Решение
+  -----------------------------  ---------------------------  ----------------------------------
+  Каталог inventory              имя файла hosts.ini          переименовали в hosts
+  не парсился                    не подхватывалось
+  Ошибка про # в конфиге         комментарий в строке         комментарии — только
+                                 со значением                 с новой строки
+  Permission denied              запуск ansible под sudo      запуск без sudo
+  (publickey)                    (root ищет ключ
+                                 в /root/.ssh)
+  Missing sudo password          пароль sudo не передавался   передаётся из Vault
+  vi: not found                  Ansible звал vi, а есть      editor = nano в конфиге
+                                 nano
+  less: not found                ansible-vault view открывал  PAGER=cat
+                                 пейджер
+  vm-deploy UNREACHABLE          контроллер шёл к себе        ansible_connection=local
+                                 по SSH
+  Правила nftables               nft -f дописывает правила    пересоздание таблицы в одной
+  дублировались                  в существующую цепочку       транзакции (см. 6.5)
+
+
+---------------------------------------------------------------------
+9. ЗАПУСК
+---------------------------------------------------------------------
+
+  # проверить связность
+  ansible all -m ping
+
+  # применить конфигурацию
+  ansible-playbook site.yml
+
+  # повторный прогон для проверки идемпотентности
+  ansible-playbook site.yml
+
+Ожидаемый результат: узлы группы app подготовлены (пакеты, таймзона,
+/etc/hosts), создан пользователь devops с ключами, SSH захардened,
+сеть и hostname настроены, межсетевой экран nftables применён.
+Повторный прогон не должен ничего менять.

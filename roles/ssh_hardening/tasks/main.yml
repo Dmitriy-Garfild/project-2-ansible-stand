@@ -1,0 +1,34 @@
+---
+- name: Убедиться, что sshd установлен
+  ansible.builtin.apt:
+    name: openssh-server
+    state: present
+
+- name: Проверить, что заданы параметры hardening
+  ansible.builtin.assert:
+    that:
+      - ssh_hardening_password_auth is defined
+      - ssh_hardening_permit_root_login is defined
+      - ssh_hardening_permit_root_login in ['yes', 'no', 'prohibit-password', 'forced-commands-only']
+    fail_msg: "Некорректные параметры ssh_hardening для {{ inventory_hostname }}"
+    quiet: true
+
+- name: Убедиться, что каталог sshd_config.d существует
+  ansible.builtin.file:
+    path: /etc/ssh/sshd_config.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Отрендерить drop-in конфиг sshd
+  ansible.builtin.template:
+    src: 00-access.conf.j2
+    dest: "{{ ssh_hardening_config_file }}"
+    owner: root
+    group: root
+    mode: "0600"
+    backup: true
+    validate: "sshd -t -f %s"    
+  notify: restart ssh
+

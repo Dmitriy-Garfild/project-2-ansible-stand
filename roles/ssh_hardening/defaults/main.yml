@@ -1,0 +1,9 @@
+---
+ssh_hardening_config_file: /etc/ssh/sshd_config.d/00-access.conf
+
+ssh_hardening_password_auth: false
+ssh_hardening_permit_root_login: "no"
+ssh_hardening_pubkey_auth: true
+ssh_hardening_kbd_interactive_auth: false
+
+ssh_hardening_service: ssh

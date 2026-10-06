@@ -1,0 +1,10 @@
+---
+- name: Базовая настройка серверов приложений
+  hosts: app
+  become: true
+  roles:
+    - common
+    - users
+    - ssh_hardening
+    - network
+    - firewall

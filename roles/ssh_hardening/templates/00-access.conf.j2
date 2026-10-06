@@ -1,0 +1,7 @@
+# {{ ansible_managed }}
+# Managed by Ansible role ssh_hardening. Do not edit manually.
+
+PasswordAuthentication {{ ssh_hardening_password_auth | ternary('yes', 'no') }}
+PermitRootLogin {{ ssh_hardening_permit_root_login }}
+PubkeyAuthentication {{ ssh_hardening_pubkey_auth | ternary('yes', 'no') }}
+KbdInteractiveAuthentication {{ ssh_hardening_kbd_interactive_auth | ternary('yes', 'no') }}

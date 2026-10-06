@@ -1,0 +1,174 @@
+---
+
+# ---------------------------------------------------------------------
+# 1. Проверки и диагностика
+# ---------------------------------------------------------------------
+- name: Проверка группы хостов
+  ansible.builtin.assert:
+    that:
+      - inventory_hostname in (groups[firewall_allowed_group] | default([]))
+    fail_msg: >-
+      Хост {{ inventory_hostname }} не входит в группу
+      '{{ firewall_allowed_group }}'. Роль firewall запрещена.
+    success_msg: "OK: {{ inventory_hostname }} в группе {{ firewall_allowed_group }}"
+    quiet: true
+
+- name: Проверка корректности переменных
+  ansible.builtin.assert:
+    that:
+      - firewall_ssh_sources | length > 0
+      - firewall_internal_iface != firewall_external_iface
+    fail_msg: "Некорректные параметры роли firewall"
+    quiet: true
+
+- name: Проверка наличия интерфейсов
+  ansible.builtin.assert:
+    that:
+      - firewall_internal_iface in ansible_interfaces
+      - firewall_external_iface in ansible_interfaces
+    fail_msg: >-
+      Не найден один из интерфейсов.
+      Доступные: {{ ansible_interfaces | join(', ') }}
+    quiet: true
+
+- name: Диагностика параметров
+  ansible.builtin.debug:
+    msg:
+      - "external : {{ firewall_external_iface }} ({{ firewall_external_cidr }})"
+      - "internal : {{ firewall_internal_iface }} ({{ firewall_internal_cidr }})"
+      - "ssh src  : {{ firewall_ssh_sources | join(', ') }}"
+      - "vm mesh  : {{ firewall_allow_vm_mesh }}"
+
+# ---------------------------------------------------------------------
+# 2. Пакет
+# ---------------------------------------------------------------------
+- name: Установка пакета nftables
+  ansible.builtin.package:
+    name: nftables
+    state: present
+
+# ---------------------------------------------------------------------
+# 3. Бэкап текущего конфига (один раз в сутки, идемпотентно)
+# ---------------------------------------------------------------------
+- name: Проверка существования текущего конфига
+  ansible.builtin.stat:
+    path: "{{ firewall_config_path }}"
+  register: fw_conf_stat
+
+- name: Бэкап текущего nftables.conf (однократно в сутки)
+  ansible.builtin.copy:
+    src: "{{ firewall_config_path }}"
+    dest: "{{ firewall_config_path }}.bak.{{ ansible_date_time.date }}"
+    remote_src: true
+    mode: "0640"
+    force: false
+  when:
+    - firewall_backup | bool
+    - fw_conf_stat.stat.exists
+
+# ---------------------------------------------------------------------
+# 4. Отрисовка конфига с валидацией — идемпотентно
+# ---------------------------------------------------------------------
+- name: Отрендерить nftables.conf (validate nft -c -f)
+  ansible.builtin.template:
+    src: nftables.conf.j2
+    dest: "{{ firewall_config_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+    validate: "nft -c -f %s"
+  register: fw_tmpl
+
+# ---------------------------------------------------------------------
+# 5. Применение — только при изменении конфига
+#    Конфиг самодостаточен (пересоздаёт таблицу), накопления нет.
+# ---------------------------------------------------------------------
+- name: Применение правил (nft -f)
+  ansible.builtin.command:
+    cmd: "nft -f {{ firewall_config_path }}"
+  register: fw_apply
+  changed_when: true
+  when: fw_tmpl is changed
+
+- name: Показать diff-признак изменения ruleset (только при firewall_debug_diff)
+  ansible.builtin.debug:
+    msg: "Конфиг изменён и применён через nft -f"
+  when:
+    - firewall_debug_diff | bool
+    - fw_tmpl is changed
+
+# ---------------------------------------------------------------------
+# 6. Сервис — только автозагрузка (правила уже применены)
+# ---------------------------------------------------------------------
+- name: Включение nftables.service (автозагрузка при старте)
+  ansible.builtin.systemd:
+    name: nftables
+    enabled: true
+    daemon_reload: false
+  when: firewall_manage_service | bool
+
+# ---------------------------------------------------------------------
+# 7. Пост-проверка
+# ---------------------------------------------------------------------
+- name: Текущие правила nftables
+  ansible.builtin.command:
+    cmd: nft list ruleset
+  register: fw_ruleset
+  changed_when: false
+  failed_when: false
+
+- name: Проверка наличия правила для порта 22
+  ansible.builtin.shell:
+    cmd: "nft list ruleset | grep -c 'dport 22' || true"
+  register: fw_ssh_rule
+  changed_when: false
+  failed_when: false
+
+- name: Валидация SSH-правила
+  ansible.builtin.assert:
+    that:
+      - fw_ssh_rule.stdout | int > 0
+    fail_msg: >-
+      В ruleset нет правила для порта 22.
+      Проверьте вручную: nft list ruleset
+    quiet: true
+  when: firewall_safety_validate | bool
+
+- name: Проверка отсутствия reject в ruleset (тихий drop)
+  ansible.builtin.shell:
+    cmd: "nft list ruleset | grep -c 'reject' || true"
+  register: fw_reject_check
+  changed_when: false
+  failed_when: false
+
+- name: Валидация тихого drop
+  ansible.builtin.assert:
+    that:
+      - fw_reject_check.stdout | int == 0
+    fail_msg: >-
+      В ruleset найдено правило 'reject'. Ожидается тихий drop.
+      Проверьте: nft list ruleset | grep reject
+    quiet: true
+  when: firewall_safety_validate | bool
+
+# --- НОВОЕ: защита от дублей цепочек (ловит накопление правил) ---
+- name: Проверка, что цепочка input не продублирована
+  ansible.builtin.shell:
+    cmd: "nft list ruleset | grep -c 'type filter hook input' || true"
+  register: fw_input_hooks
+  changed_when: false
+  failed_when: false
+
+- name: Валидация отсутствия дублей цепочки input
+  ansible.builtin.assert:
+    that:
+      - fw_input_hooks.stdout | int == 1
+    fail_msg: >-
+      Цепочка input объявлена {{ fw_input_hooks.stdout }} раз(а) вместо 1.
+      Ruleset накапливает правила — проверьте шаблон nftables.conf.j2.
+    quiet: true
+  when: firewall_safety_validate | bool
+
+- name: Итоговый ruleset
+  ansible.builtin.debug:
+    msg: "{{ fw_ruleset.stdout_lines | default(['n/a']) }}"

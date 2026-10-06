@@ -1,0 +1,8 @@
+---
+ansible_become_pass: "{{ ansible_become_password }}"
+
+common_timezone: "Europe/Moscow"
+
+common_hosts_entries:
+  - { ip: "192.168.1.11", names: "vm-deploy" }
+  - { ip: "192.168.1.12", names: "vm-app" }
